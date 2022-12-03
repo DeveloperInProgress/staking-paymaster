@@ -11,7 +11,11 @@ import {
   TestCounter,
   TestCounter__factory,
   TestToken,
-  TestToken__factory
+  TestToken__factory,
+  StakingPaymaster__factory,
+  MockStake,
+  MockStake__factory,
+  StakingPaymaster
 } from '../typechain'
 import {
   AddressZero, createAddress,
@@ -21,22 +25,26 @@ import {
 import { fillAndSign } from './UserOp'
 import { hexConcat, hexZeroPad, parseEther } from 'ethers/lib/utils'
 
-describe('DepositPaymaster', () => {
+describe('StakingPaymaster', () => {
   let entryPoint: EntryPoint
   const ethersSigner = ethers.provider.getSigner()
   let token: TestToken
-  let paymaster: DepositPaymaster
+  let stake: MockStake
+  let paymaster: StakingPaymaster
   before(async function () {
     entryPoint = await deployEntryPoint()
 
-    paymaster = await new DepositPaymaster__factory(ethersSigner).deploy(entryPoint.address)
+    token = await new TestToken__factory(ethersSigner).deploy()
+    const testOracle = await new TestOracle__factory(ethersSigner).deploy()
+
+    stake = await new MockStake__factory(ethersSigner).deploy(token.address, testOracle.address)
+    paymaster = await new StakingPaymaster__factory(ethersSigner).deploy(entryPoint.address)
     await paymaster.addStake(1, { value: parseEther('2') })
     await entryPoint.depositTo(paymaster.address, { value: parseEther('1') })
 
-    token = await new TestToken__factory(ethersSigner).deploy()
-    const testOracle = await new TestOracle__factory(ethersSigner).deploy()
-    await paymaster.addToken(token.address, testOracle.address)
+    await paymaster.addStakingContract(stake.address);
 
+    await stake.addPaymaster(paymaster.address);
     await token.mint(await ethersSigner.getAddress(), FIVE_ETH)
     await token.approve(paymaster.address, ethers.constants.MaxUint256)
   })
@@ -84,30 +92,33 @@ describe('DepositPaymaster', () => {
     before(async () => {
       accountOwner = await ethersSigner.getAddress()
       account = await new SimpleAccount__factory(ethersSigner).deploy(entryPoint.address, accountOwner)
+    
+      await token.mint(account.address, FIVE_ETH);
+      await token.connect(ethersSigner).approve(paymaster.address, ONE_ETH)
     })
 
-    it('should fail if no token', async () => {
+    it('should fail if no staking contract', async () => {
       const userOp = await fillAndSign({
         sender: account.address,
         paymasterAndData: paymaster.address
       }, ethersSigner, entryPoint)
-      await expect(entryPoint.callStatic.simulateValidation(userOp)).to.be.revertedWith('paymasterAndData must specify token')
+      await expect(entryPoint.callStatic.simulateValidation(userOp)).to.be.revertedWith('StakingPaymaster: paymasterData must specify staking contract')
     })
 
-    it('should fail with wrong token', async () => {
+    it('should fail with wrong staking contract', async () => {
       const userOp = await fillAndSign({
         sender: account.address,
         paymasterAndData: hexConcat([paymaster.address, hexZeroPad('0x1234', 20)])
       }, ethersSigner, entryPoint)
-      await expect(entryPoint.callStatic.simulateValidation(userOp, { gasPrice })).to.be.revertedWith('DepositPaymaster: unsupported token')
+      await expect(entryPoint.callStatic.simulateValidation(userOp, { gasPrice })).to.be.revertedWith('StakingPaymaster: Invalid staking contract')
     })
 
     it('should reject if no deposit', async () => {
       const userOp = await fillAndSign({
         sender: account.address,
-        paymasterAndData: hexConcat([paymaster.address, hexZeroPad(token.address, 20)])
+        paymasterAndData: hexConcat([paymaster.address, hexZeroPad(stake.address, 20)])
       }, ethersSigner, entryPoint)
-      await expect(entryPoint.callStatic.simulateValidation(userOp, { gasPrice })).to.be.revertedWith('DepositPaymaster: deposit too low')
+      await expect(entryPoint.callStatic.simulateValidation(userOp, { gasPrice })).to.be.revertedWith('StakingPaymaster: deposit too low')
     })
 
     it('should reject if deposit is not locked', async () => {
@@ -118,7 +129,7 @@ describe('DepositPaymaster', () => {
 
       const userOp = await fillAndSign({
         sender: account.address,
-        paymasterAndData: hexConcat([paymaster.address, hexZeroPad(token.address, 20)])
+        paymasterAndData: hexConcat([paymaster.address, hexZeroPad(stake.address, 20)])
       }, ethersSigner, entryPoint)
       await expect(entryPoint.callStatic.simulateValidation(userOp, { gasPrice })).to.be.revertedWith('not locked')
     })
@@ -130,30 +141,34 @@ describe('DepositPaymaster', () => {
 
       const userOp = await fillAndSign({
         sender: account.address,
-        paymasterAndData: hexConcat([paymaster.address, hexZeroPad(token.address, 20)])
-      }, ethersSigner, entryPoint)
-      throw new Error(userOp.paymasterAndData.length.toString())
+        paymasterAndData: hexConcat([paymaster.address, hexZeroPad(stake.address, 20)])
+      }, ethersSigner, entryPoint);
+      //throw new Error(hexConcat([paymaster.address, hexZeroPad(stake.address, 20)]))
+      //throw new Error(paymaster.address.length.toString())
+      //throw new Error(hexZeroPad(stake.address, 20))
+      //throw new Error(userOp.paymasterAndData.length.toString())
       await entryPoint.callStatic.simulateValidation(userOp).catch(simulationResultCatch)
     })
   })
-  describe('#handleOps', () => {
+  describe('#handleOps', async () => {
     let account: SimpleAccount
-    const accountOwner = createAccountOwner()
+    const [accountOwner] = await ethers.getSigners();
     let counter: TestCounter
     let callData: string
     before(async () => {
-      account = await new SimpleAccount__factory(ethersSigner).deploy(entryPoint.address, accountOwner.address)
-      counter = await new TestCounter__factory(ethersSigner).deploy()
-      const counterJustEmit = await counter.populateTransaction.justemit().then(tx => tx.data!)
-      callData = await account.populateTransaction.execFromEntryPoint(counter.address, 0, counterJustEmit).then(tx => tx.data!)
-
-      await paymaster.addDepositFor(token.address, account.address, ONE_ETH)
+        account = await new SimpleAccount__factory(ethersSigner).deploy(entryPoint.address, accountOwner.address)
+        counter = await new TestCounter__factory(ethersSigner).deploy()
+        const counterJustEmit = await counter.populateTransaction.justemit().then(tx => tx.data!)
+        callData = await account.populateTransaction.execFromEntryPoint(counter.address, 0, counterJustEmit).then(tx => tx.data!)
+        await token.mint(account.address, ONE_ETH);
+        await token.connect(accountOwner).approve(paymaster.address, ONE_ETH)
+        await paymaster.addDepositFor(token.address, account.address, ONE_ETH)
     })
-    it('should pay with deposit (and revert user\'s call) if user can\'t pay with tokens', async () => {
+    it('should pay with deposit (and revert user\'s call) if user can\'t pay with stake rewards', async () => {
       const beneficiary = createAddress()
       const userOp = await fillAndSign({
         sender: account.address,
-        paymasterAndData: hexConcat([paymaster.address, hexZeroPad(token.address, 20)]),
+        paymasterAndData: hexConcat([paymaster.address, hexZeroPad(stake.address, 20)]),
         callData
       }, accountOwner, entryPoint)
 
@@ -165,21 +180,11 @@ describe('DepositPaymaster', () => {
       expect(await ethers.provider.getBalance(beneficiary)).to.be.gt(0)
     })
 
-    it('should pay with tokens if available', async () => {
+    it('should pay with stake if available', async () => {
       const beneficiary = createAddress()
       const beneficiary1 = createAddress()
-      const initialTokens = parseEther('1')
-      await token.mint(account.address, initialTokens)
-
-      // need to "approve" the paymaster to use the tokens. we issue a UserOp for that (which uses the deposit to execute)
-      const tokenApprovePaymaster = await token.populateTransaction.approve(paymaster.address, ethers.constants.MaxUint256).then(tx => tx.data!)
-      const execApprove = await account.populateTransaction.execFromEntryPoint(token.address, 0, tokenApprovePaymaster).then(tx => tx.data!)
-      const userOp1 = await fillAndSign({
-        sender: account.address,
-        paymasterAndData: hexConcat([paymaster.address, hexZeroPad(token.address, 20)]),
-        callData: execApprove
-      }, accountOwner, entryPoint)
-      await entryPoint.handleAggregatedOps(userOpsWithoutAgg([userOp1]), beneficiary1)
+      const rewards = parseEther('1')
+      await stake.setRewards(rewards)
 
       const userOp = await fillAndSign({
         sender: account.address,
